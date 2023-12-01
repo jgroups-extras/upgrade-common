@@ -1,0 +1,236 @@
+package org.jgroups.rolling_upgrades;
+
+import com.google.protobuf.ByteString;
+import io.grpc.ManagedChannel;
+import io.grpc.netty.GrpcSslContexts;
+import io.grpc.netty.NettyChannelBuilder;
+import io.grpc.stub.StreamObserver;
+import io.netty.handler.ssl.SslContext;
+
+import java.io.FileNotFoundException;
+import java.io.InputStream;
+import java.util.HashSet;
+import java.util.Set;
+import java.util.concurrent.TimeUnit;
+import java.util.function.Consumer;
+import java.util.logging.Logger;
+
+import static org.jgroups.rolling_upgrades.ConnectionStatus.State.*;
+
+
+/**
+ * Class which interacts with a gRPC server, e.g. sending and receiving messages, retry logic etc. The state transitions
+ * are start - connect - disconnect (possibly multiple times) - stop
+ * @author Bela Ban
+ * @since  1.1.1
+ */
+public class UpgradeClient implements StreamObserver<Response> {
+    protected String                       server_address="localhost";
+    protected int                          server_port=50051;
+    protected String                       server_cert;
+    protected ManagedChannel               channel;
+    protected UpgradeServiceGrpc.UpgradeServiceStub asyncStub;
+    // protected UpgradeServiceBlockingStub   syncStub; // we can have both a sync/async stub; they use the same channel
+    protected StreamObserver<Request>      send_stream;
+    protected final Set<Consumer<View>>    view_handlers=new HashSet<>();
+    protected final Set<Consumer<Message>> message_handlers=new HashSet<>();
+    protected Consumer<GetViewResponse>    view_rsp_handler;
+    protected final ConnectionStatus       state=new ConnectionStatus();
+    protected long                         reconnect_interval=3000; // in ms
+    protected Runner                       reconnector;
+    protected Runnable                     reconnect_function;
+    protected static final Logger          log=Logger.getLogger(UpgradeClient.class.getSimpleName());
+
+    public String        getServerAddress()                                  {return server_address;}
+    public UpgradeClient setServerAddress(String a)                          {server_address=a; return this;}
+    public int           getServerPort()                                     {return server_port;}
+    public UpgradeClient setServerPort(int p)                                {server_port=p; return this;}
+    public String        getServerCert()                                     {return server_cert;}
+    public UpgradeClient setServerCert(String c)                             {server_cert=c; return this;}
+    public boolean       isConnected()                                       {return state.isState(ConnectionStatus.State.connected);}
+    public ConnectionStatus state()                                          {return state;}
+    public UpgradeClient setReconnectionFunction(Runnable f)                 {reconnect_function=f; return this;}
+    public long          getReconnectInterval()                              {return reconnect_interval;}
+    public UpgradeClient setReconnectInterval(long i)                        {reconnect_interval=i; return this;}
+    public UpgradeClient addViewHandler(Consumer<View> h)                    {view_handlers.add(h); return this;}
+    public UpgradeClient removeViewHandler(Consumer<View> h)                 {view_handlers.remove(h); return this;}
+    public UpgradeClient addMessageHandler(Consumer<Message> h)              {message_handlers.add(h); return this;}
+    public UpgradeClient removeMessageHandler(Consumer<Message> h)           {message_handlers.remove(h); return this;}
+    public UpgradeClient setViewResponseHandler(Consumer<GetViewResponse> h) {this.view_rsp_handler=h; return this;}
+    public Consumer<GetViewResponse> getViewResponseHandler()                {return view_rsp_handler;}
+    public boolean       reconnectorRunning()                                {return reconnector.isRunning();}
+
+
+
+    public UpgradeClient start() throws Exception {
+        InputStream server_cert_stream=null;
+        SslContext  ctx=null;
+
+        if(server_cert != null && !server_cert.trim().isEmpty()) {
+            if((server_cert_stream=Utils.getFile(server_cert)) == null)
+                throw new FileNotFoundException(String.format("server certificate (%s) not found", server_cert));
+            ctx=GrpcSslContexts.forClient().trustManager(server_cert_stream).build();
+        }
+        NettyChannelBuilder cb=NettyChannelBuilder.forAddress(server_address, server_port);
+        if(server_cert_stream == null)
+            channel=cb.usePlaintext().build();
+        else
+            channel=cb.sslContext(ctx).build();
+        asyncStub=UpgradeServiceGrpc.newStub(channel);
+        // syncStub=UpgradeServiceGrpc.newBlockingStub(channel);
+        if(reconnect_function != null)
+            reconnector=createReconnector();
+        return this;
+    }
+
+    public UpgradeClient stop() {
+        if(channel != null) {
+            channel.shutdown();
+            try {
+                channel.awaitTermination(30, TimeUnit.SECONDS);
+            }
+            catch(InterruptedException e) {
+            }
+        }
+        return this;
+    }
+
+    public synchronized UpgradeClient registerView(String cluster, View local_view, Address local_addr) {
+        if(state.setState(disconnected, connecting)) {
+            send_stream=asyncStub.connect(this);
+            RegisterView register_req=RegisterView.newBuilder().setClusterName(cluster).setView(local_view)
+              .setLocalAddr(local_addr).build();
+            Request req=Request.newBuilder().setRegisterReq(register_req).build();
+            send_stream.onNext(req);
+        }
+        return this;
+    }
+
+    public synchronized UpgradeClient getViewFromServer(String cluster) {
+        GetViewRequest gv=GetViewRequest.newBuilder().setClusterName(cluster).build();
+        Request req=Request.newBuilder().setGetViewReq(gv).build();
+        send_stream.onNext(req);
+        return this;
+    }
+
+    public synchronized UpgradeClient connect(String cluster, Address local_addr) {
+        if(state.setState(disconnected, connecting)) {
+            send_stream=asyncStub.connect(this);
+            JoinRequest join_req=JoinRequest.newBuilder().setAddress(local_addr).setClusterName(cluster).build();
+            Request req=Request.newBuilder().setJoinReq(join_req).build();
+            send_stream.onNext(req);
+        }
+        return this;
+    }
+
+    public synchronized UpgradeClient disconnect(String cluster, Address local_addr) {
+        if(send_stream != null) {
+            if(local_addr != null && cluster != null) {
+                LeaveRequest leave_req=LeaveRequest.newBuilder().setClusterName(cluster).setLeaver(local_addr).build();
+                Request request=Request.newBuilder().setLeaveReq(leave_req).build();
+                send_stream.onNext(request);
+                state.setState(disconnected);
+            }
+            send_stream.onCompleted();
+        }
+        return this;
+    }
+
+    public synchronized UpgradeClient send(Request req) {
+        if(state.isStateOneOf(disconnected, disconnecting))
+            throw new IllegalStateException(String.format("not connected to %s:%d", server_address, server_port));
+        send_stream.onNext(req);
+        return this;
+    }
+
+    public void onNext(Response rsp) {
+        if(rsp.hasMessage()) {
+            handleMessage(rsp.getMessage());
+            return;
+        }
+        if(rsp.hasView()) {
+            handleView(rsp.getView());
+            return;
+        }
+        if(rsp.hasRegViewOk()) {
+            state.setState(ConnectionStatus.State.connected);
+            return;
+        }
+        if(rsp.hasGetViewRsp()) {
+            if(view_rsp_handler != null)
+                view_rsp_handler.accept(rsp.getGetViewRsp());
+            return;
+        }
+        throw new IllegalStateException(String.format("response is illegal: %s", rsp));
+    }
+
+    public void onError(Throwable t) {
+        if(state.isState(ConnectionStatus.State.connected))
+            log.warning(String.format("exception from server: %s (%s)", t, t.getCause()));
+        state.setState(disconnected);
+        startReconnector();
+    }
+
+    public void onCompleted() {
+    }
+
+
+    protected void handleMessage(Message msg) {
+        for(Consumer<Message> c: message_handlers)
+            c.accept(msg);
+    }
+
+    protected void handleView(View view) {
+        state.setState(ConnectionStatus.State.connected);
+        stopReconnector();
+        for(Consumer<View> c: view_handlers)
+            c.accept(view);
+    }
+
+    protected synchronized Runner createReconnector() {
+        return new Runner("client-reconnector",
+                          () -> {
+                              reconnect_function.run();
+                              Utils.sleep(reconnect_interval);
+                          },null);
+    }
+
+    protected synchronized UpgradeClient startReconnector() {
+        if(reconnector != null && !reconnector.isRunning()) {
+            log.fine("starting reconnector");
+            reconnector.start();
+        }
+        return this;
+    }
+
+    protected synchronized UpgradeClient stopReconnector() {
+        if(reconnector != null && reconnector.isRunning()) {
+            log.fine("stopping reconnector");
+            reconnector.stop();
+        }
+        return this;
+    }
+
+
+    public static void main(String[] args) throws Exception {
+        UpgradeClient client=new UpgradeClient()
+          .addMessageHandler(m -> System.out.printf("-- msg from %s: %s\n",
+                                                    m.getSender().getName(), new String(m.getPayload().toByteArray())))
+          .addViewHandler(v -> System.out.printf("-- view: %s\n", v))
+          .start();
+
+
+        UUID uuid=UUID.newBuilder().setLeastSig(1).setMostSig(2).build();
+        Address a=Address.newBuilder().setUuid(uuid).setName("A").build();
+        client.connect("rpcs", a);
+
+        byte[] buf="hello world".getBytes();
+        Message msg=Message.newBuilder()
+          .setClusterName("rpcs")
+          .setSender(Address.newBuilder().setName("A").setUuid(uuid).build())
+          .setPayload(ByteString.copyFrom(buf)).build();
+        client.send(Request.newBuilder().setMessage(msg).build());
+        client.disconnect("rpcs", a);
+
+    }
+}

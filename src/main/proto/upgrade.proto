@@ -1,0 +1,153 @@
+syntax="proto3";
+
+package org.jgroups.rolling_upgrades;
+
+// import "google/protobuf/any.proto";
+
+
+option java_multiple_files = true;
+
+
+service UpgradeService {
+    rpc Connect (stream Request) returns (stream Response);
+    rpc Dump (Void)              returns (DumpResponse);
+}
+
+message Message {
+    string    cluster_name = 1;
+    Address   destination  = 2; // null: send to all
+    Address   sender       = 3;
+    int32     flags        = 4;
+    bytes     payload      = 5;
+    Headers   headers      = 6; // if the message is an RPC, otherwise this field will be null
+    Metadata  meta_data    = 7; // metadata (may be null)
+}
+
+message JoinRequest {
+    string  cluster_name = 1;
+    Address address      = 2;
+}
+
+/** Used for graceful leaves. Ungraceful leaves (e.g. crashes) are detected by the UpgradeService directly  */
+message LeaveRequest {
+    string  cluster_name = 1;
+    Address leaver       = 2;
+}
+
+/** Sent by the coordinator on activate(). The UpgradeServer then adds the view into its map, overwriting any view
+ already present. When view is null, the entry matching cluster_name will be removed (on deactivate()) */
+message RegisterView {
+    string  cluster_name = 1;
+    View    view         = 2;
+    Address local_addr   = 3;
+}
+
+message RegisterViewOk {
+}
+
+/** Gets the view from the UpgradeServer */
+message GetViewRequest {
+    string cluster_name = 1;
+}
+
+message GetViewResponse {
+    View view = 1;
+}
+
+message Address {
+    string name = 1; // logical name
+    oneof actual_address {
+        UUID     uuid      = 2;
+        SiteUUID site_uuid = 3;
+    }
+}
+
+message ViewId {
+    int64 id        = 1;
+    Address creator = 2;
+}
+
+message View {
+    ViewId           view_id = 1;
+    repeated Address member  = 2;
+}
+
+message UUID {
+    int64 most_sig   = 1; // most significant bits
+    int64 least_sig  = 2; // least significant bits
+}
+
+message SiteUUID {
+    UUID   uuid                   = 1;
+    string site_name              = 2;
+    bool   is_site_master         = 3; // -> SiteMaster if true
+}
+
+
+message Request {
+    oneof one_of {
+        Message      message        = 1;
+        JoinRequest  join_req       = 2;
+        LeaveRequest leave_req      = 3;
+        RegisterView register_req   = 4;
+        GetViewRequest get_view_req = 5;
+    }
+}
+
+message Response {
+    oneof one_of {
+        Message         message      = 1;
+        View            view         = 2;
+        RegisterViewOk  reg_view_ok  = 3;
+        GetViewResponse get_view_rsp = 4;
+    }
+}
+
+
+message Void {
+    // contains nothing
+}
+
+message DumpResponse {
+    string dump = 1;
+}
+
+/** Header used for RPCs (RpcDispatcher / MessageDispatcher) */
+message RpcHeader {
+    int32            type           = 1; // 0=request, 1=response, 2=exception
+    int64            request_id     = 2;
+    int32            corr_id        = 3;
+    repeated Address exclusion_list = 4;
+}
+
+message RelayHeader {
+    enum Type {
+        DATA             = 0;
+        SITE_UNREACHABLE = 1; // final_dest is a SiteMaster
+        HOST_UNREACHABLE = 2; // final_dest is a SiteUUID (not currently used)
+        SITES_UP         = 3;
+        SITES_DOWN       = 4;
+        TOPO_REQ         = 5;
+        TOPO_RSP         = 6;
+    }
+    Type             type            = 1;
+    Address          final_dest      = 2;
+    Address          original_sender = 3;
+    repeated string  sites           = 4;
+}
+
+message Headers {
+    RpcHeader   rpc_hdr   = 1;
+    RelayHeader relay_hdr = 2;
+}
+
+message Metadata {
+    int32 msg_type  = 1;
+    int32 version   = 2;
+}
+
+/** Represent a method call used by RPCs (payload of a message) */
+/*message MethodCall {
+    int32 id                               = 1; // the ID of the method.
+    repeated google.protobuf.Any arguments = 2;
+}*/
