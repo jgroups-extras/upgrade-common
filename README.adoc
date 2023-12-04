@@ -113,7 +113,7 @@ change, so that different JGroups versions can talk to the server as long as the
 implements the communication protocol correctly.
 
 Since an `UPGRADE` protocol is specific to a given JGroups version, it resides in a separate project, e.g.
-https://github.com/jgroups-extras/rolling-upgrades/upgrade-jgroups-5.2 (`UPGRADE` for JGroups 5.2.x).
+https://github.com/jgroups-extras/upgrade-jgroups-5.2 (`UPGRADE` for JGroups 5.2.x).
 
 This design is similar to `RELAY` (https://github.com/belaban/JGroups/blob/master/src/org/jgroups/protocols/RELAY.java),
 but uses an external UpgradeServer and a version agnostic communication protocol to talk to it,
