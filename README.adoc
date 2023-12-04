@@ -1,0 +1,165 @@
+= Rolling upgrades of a JGroups cluster
+
+This document describes how to upgrade a JGroups cluster to a new, incompatible version,
+or a new configuration. The term _incompatible_ means that the nodes running on the new version
+(or configuration) would be unable to form a cluster with the existing nodes.
+
+Upgrading a cluster to a new version is critical for some customers, who cannot afford downtime.
+
+The design is influenced by how Kubernetes applies a new configuration: it adds a new pod, running with the new
+configuration, then kills off an existing one, until all existing pods have been replaced.
+
+
+== Overview
+
+Say we have a cluster `{A1,A2,A3}`. A rolling upgrade might proceed as follows:
+
+* `{A1,A2,A3}`
+* New node `B1` is started in a separate cluster: `{A1,A2,A3} {B1}`
+* An existing node is killed: `{A1,A3} {B1}`
+** Note that we don't know (in Kubernetes) which node is killed
+* And so on:
+* `{A1,A3} {B1,B2}`
+* `{A3} {B1,B2}`
+* `{A3} {B1,B2,B3}`
+* `{B1,B2,B3}`
+
+=== Goals
+
+There are 2 goals for the above scenario:
+
+. There needs to be a _global view_ of all nodes; ie. instead of the 2 separate
+cluster views `{A1,A2,A3}` and `{B1}`, the global view should be the virtual view `{A1,A2,A3,B1}`.
+. Members of the different clusters must be able to talk to each other; a.k.a. send
+(unicast and multicast) messages to each other. In the above example, `A2` should be able to send
+a message to `B1`.
+
+
+=== Design
+
+In order to achieve the above goals, all application messages are sent to a JGroups-independent
+server (the _UpgradeServer_), which relays them to all registered cluster nodes, as shown below:
+
+----
+                    -----------------
+                    | UpgradeServer |
+                    -----------------
+                           ^
+                           |
+                           |
+        ---------------------------------
+        |      |        |         |      |
+        |      |        |         |      |
+        v      v        v         v      v
+      ----    ----    ----      ----   ----
+      |A1|    |A2|    |A3|      |B1|   |B2|
+      ----    ----    ----      ----   ----
+----
+
+Each node knows the address of the UpgradeServer and registers with it by establishing a TCP connection.
+The UpgradeServer maintains a table of clusters mapped to nodes belonging to them.
+
+When a message is received from one of the nodes, the UpgradeServer forwards the message to registered
+nodes (multicast message), or to an individual node (unicast message).
+
+NOTE: When talking about messages above, we're not referring to `org.jgroups.Message`, but instead to
+simple `byte[]` arrays, which are version-independent.
+
+The server also installs _virtual views_ in all registered nodes when a new node joins. This gives
+the application the illusion of a global cluster with both existing and new members in the same
+view. This is needed for example by Infinispan to compute the consistent hash wheel correctly, and
+perform correct data rebalancing when (e.g.) `B1` is started.
+
+NOTE: It is paramount that the communication protocol between a node and the UpgradeServer is well-defined
+and never changes, so that different versions of JGroups can talk to the same UpgradeServer.
+
+The communication on the client (cluster node) side is performed by `UPGRADE`:
+
+----
+            Application
+                 ^
+                 |
+                 | (send, receive)
+                 |
+                 v
+            -----------         (forward,receive)          -----------------
+            | UPGRADE | <------------------------------->  | UpgradeServer |
+            -----------   (JGroups-independent protocol)   -----------------
+            |  FRAG3  |
+            -----------
+            | NAKACK2 |
+            -----------
+            |    ...  |
+            -----------
+----
+
+`UPGRADE` is added at the top of the stack. When active, it forwards all application messages to the
+UpgradeServer, instead of sending them down the stack. When not active, messages are not forwarded to the
+server, but simply sent down the stack.
+
+When it receives a message from the UpgradeServer, it passes it up the stack to the application.
+
+When a cluster member joins, `UPGRADE` will get the view of the local cluster (e.g. `{A1,A2,A3}`)
+from below. It stores the local view, but does not pass it up to the application. Instead, it asks
+the UpgradeServer to add it to the current global view. The UpgradeServer then creates a new global
+virtual view and sends it to all registered cluster members. Their `UPGRADE` protocols send that
+global view up the stack to the application.
+
+This means, that applications with a stack that has `UPGRADE` at the top will never receive cluster-local
+views, but only global views created by the UpgradeServer.
+
+The communication protocol between `UPGRADE` and UpgradeServer needs to be well-defined and should never
+change, so that different JGroups versions can talk to the server as long as their `UPGRADE` protocol
+implements the communication protocol correctly.
+
+Since an `UPGRADE` protocol is specific to a given JGroups version, it resides in a separate project, e.g.
+https://github.com/jgroups-extras/rolling-upgrades/upgrade-jgroups-5.2 (`UPGRADE` for JGroups 5.2.x).
+
+This design is similar to `RELAY` (https://github.com/belaban/JGroups/blob/master/src/org/jgroups/protocols/RELAY.java),
+but uses an external UpgradeServer and a version agnostic communication protocol to talk to it,
+so that different JGroups versions can talk to each other (via UpgradeServer).
+
+
+
+
+=== Example of a rolling upgrade
+
+Say we have cluster members `{A1,A2,A3}`, running on JGroups 3.6. We want to upgrade them to version
+4.x, resulting in a cluster `{B1,B2,B3}`. The following steps need to be taken when running on
+Kubernetes:
+
+* A new service/pod needs to be started with the UpgradeServer. It runs on a given address and port.
+* The 3.6 configuration is changed to contain `UPGRADE` at the top. (If already present, this and the
+next step can be skipped). Alternatively, `UPGRADE` can be added to the existing cluster members
+dynamically via `probe.sh` (see the JGroups manual for details).
+** Note that `UPGRADE` is configured to be inactive, so no messages are relayed, and no global
+views are installed.
+* `kubectl apply` is executed to update all cluster members to a 3.6 configuration that contains
+`UPGRADE`.
+* Once this is done, `UPGRADE` in all cluster members is configured to be active. This can be done
+via the UpgradeServer sending an `ACTIVATE` command to the cluster members. From now one, virtual
+global views and message relaying is enabled.
+* `kubectl apply` is executed *to apply a new configuration*. The new configuration points to an image
+with JGroups 4.x (the existing cluster members are running on 3.6), and possibly a new JGroups config.
+* Kubernetes starts a new pod with the new config and then kills off an existing node (as described
+in the overview section).
+** The new config includes an _active_ `UPGRADE` protocol at the top of the stack
+* When members are added/killed, a new global view will be installed via UpgradeServer
+* When all members have been updated to the new version, a `DEACTIVATE` command is sent to all cluster members,
+which de-activate `UPGRADE` (or even remove it from the stack).
+* The UpgradeServer pod can now safely be killed.
+
+
+=== Using secure connections
+By default, `UpgradeServer` and the clients (`UPGRADE` protocols) use plaintext gRpc connections. This can be changed,
+so that communication between server and clients is encrypted. To do this, 3 steps have to be taken:
+
+. Generate a certificate and a private/public key pair for the server and clients to use
+* This can be done with `bin/genkey.sh`: this generates `server.cert` and `server.key`
+** Make sure you set the hostname (in `genkey.sh`) to the host on which `UpgradeServer` will be running.
+* Of course, in a production environment, self-signed certificates should not be used!
+. Run UpgradeServer with the key and certificate
+* Pass options `-cert <path-to-certificate>` and `-key <path-to-key>` to `UpgradeServer`.
+. Set `server_cert` in `UPGRADE` to point to the server's certificate (generated above)
+* `<UPGRADE server_cert="/home/user/certs/server.cert" />`
+
