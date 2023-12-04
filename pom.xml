@@ -50,7 +50,10 @@
   </licenses>
 
   <scm>
-    <connection>scm:git:git@github.com:jgroups-extras/upgrade-common.git</connection>
+    <connection>scm:git:git://github.com:jgroups-extras/upgrade-common.git</connection>
+    <developerConnection>scm:git:ssh://git@github.com:jgroups-extras/upgrade-common.git</developerConnection>
+    <url>https://github.com/jgroups-extras/upgrade-common</url>
+    <tag>HEAD</tag>
   </scm>
 
   <distributionManagement>
