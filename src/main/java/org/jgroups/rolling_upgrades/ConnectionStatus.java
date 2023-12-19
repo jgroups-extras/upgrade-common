@@ -5,7 +5,7 @@ package org.jgroups.rolling_upgrades;
  * @since  1.1.1
  */
 public class ConnectionStatus {
-    public enum State {disconnected, connecting, connected, disconnecting};
+    public enum State {disconnected, connecting, connected, disconnecting, reconnecting};
 
     protected State state=State.disconnected;
 
@@ -16,6 +16,14 @@ public class ConnectionStatus {
 
     public synchronized boolean setState(State expected, State to) {
         if(state == expected) {
+            state=to;
+            return true;
+        }
+        return false;
+    }
+
+    public synchronized boolean setStateIfNot(State expected, State to) {
+        if(state != expected) {
             state=to;
             return true;
         }
