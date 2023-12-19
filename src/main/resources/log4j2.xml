@@ -13,11 +13,8 @@
         <root level="warn">
             <appender-ref ref="STDOUT"/>
         </root>
-        <!--logger name="org.jgroups.protocoUDPbcast.GMS" level="warn">
-            <appender-ref ref="File"/>
-        </logger-->
-
-        <logger name="org.jgroups.upgrade_server" level="warn"/>
-        <logger name="org.jgroups.upgrade_server.UpgradeService"  level="DEBUG"/>
+        <logger name="org.jgroups.rolling_upgrades" level="warn"/>
+        <!--logger name="org.jgroups.rolling_upgrades.UpgradeService"  level="DEBUG"/>
+        <logger name="org.jgroups.rolling_upgrades.UpgradeClient" level="debug"/-->
     </loggers>
 </configuration>
