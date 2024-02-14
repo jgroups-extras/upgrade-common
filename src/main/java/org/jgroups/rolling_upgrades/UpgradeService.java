@@ -66,7 +66,7 @@ public class UpgradeService extends UpgradeServiceGrpc.UpgradeServiceImplBase {
                 }
                 if(req.hasLeaveReq()) {
                     log.debug("handleLeaveRequest(%s)", req.getLeaveReq().getLeaver().getName());
-                    handleLeaveRequest(req.getLeaveReq(), responseObserver);
+                    handleLeaveRequest(req.getLeaveReq());
                     return;
                 }
                 if(req.hasGetViewReq()) {
@@ -130,7 +130,7 @@ public class UpgradeService extends UpgradeServiceGrpc.UpgradeServiceImplBase {
         }
     }
 
-    protected void handleLeaveRequest(LeaveRequest leave_req, StreamObserver<Response> responseObserver) {
+    protected void handleLeaveRequest(LeaveRequest leave_req) {
         final String  cluster=leave_req.getClusterName();
         Address       leaver=leave_req.getLeaver();
         if(leaver == null)
@@ -188,17 +188,16 @@ public class UpgradeService extends UpgradeServiceGrpc.UpgradeServiceImplBase {
 
 
     protected void relayToAll(Message msg, SynchronizedMap m) {
-        if(!m.isEmpty()) {
-            Response response=Response.newBuilder().setMessage(msg).build();
+        if(m.isEmpty())
+            return;
+        Response response=Response.newBuilder().setMessage(msg).build();
 
-            // need to honor the exclusion list in the header if present
-            Headers hdrs=msg.getHeaders();
-            RpcHeader rpcHeader = hdrs != null && hdrs.hasRpcHdr()? hdrs.getRpcHdr() : null;
-            Set<Address> exclusions=new HashSet<>();
-            if(rpcHeader != null && rpcHeader.getExclusionListList() != null && !rpcHeader.getExclusionListList().isEmpty())
-                exclusions.addAll(rpcHeader.getExclusionListList());
-            m.forAll(response, exclusions, (__,v) -> remove(v));
-        }
+        // need to honor the exclusion list of the RpcHeader if present
+        RpcHeader rpcHeader=getRpcHeader(msg);
+        List<Address> exclusions=null;
+        if(rpcHeader != null && rpcHeader.getExclusionListList() != null && !rpcHeader.getExclusionListList().isEmpty())
+            exclusions=rpcHeader.getExclusionListList();
+        m.forAll(response, exclusions, (__,v) -> remove(v));
     }
 
     protected void relayTo(Address dest, Message msg, SynchronizedMap m) {
@@ -220,6 +219,16 @@ public class UpgradeService extends UpgradeServiceGrpc.UpgradeServiceImplBase {
         }
     }
 
+    protected static RpcHeader getRpcHeader(Message msg) {
+        List<Header> headers=msg.getHeadersList();
+        if(headers == null)
+            return null;
+        for(Header list: headers) {
+            if(list.hasRpcHdr())
+                return list.getRpcHdr();
+        }
+        return null;
+    }
 
     protected void remove(StreamObserver<Response> observer) {
         if(observer == null)
@@ -312,7 +321,7 @@ public class UpgradeService extends UpgradeServiceGrpc.UpgradeServiceImplBase {
             return view_builder.build();
         }
 
-        protected void forAll(Response response, Set<Address> exclusions,
+        protected void forAll(Response response, List<Address> exclusions,
                               BiConsumer<Address,StreamObserver<Response>> exception_handler) {
             List<Record> observers=new ArrayList<>();
             synchronized(this) {

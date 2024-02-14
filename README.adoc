@@ -163,3 +163,11 @@ so that communication between server and clients is encrypted. To do this, 3 ste
 . Set `server_cert` in `UPGRADE` to point to the server's certificate (generated above)
 * `<UPGRADE server_cert="/home/user/certs/server.cert" />`
 
+=== Restrictions
+Applications wanting to use rolling upgrades have to take certain restrictions into account:
+
+* Only `BytesMessage` is currently (as of Jan 2024) supported. `NioMessage` should work, but has not yet been tested
+* `RELAY3`
+** Currently, only a subset of JGroups headers is supported: `ForkHeader`, `RelayHeader`, `UnicastHeader` and `RequestCorrelator.Header`
+** If `RELAY3` resides below other protocols, then - depending on the protocol type - those headers will also
+have to be supported, e.g. `FragHeader`. There is currently no way to suppor headers in a generic way
